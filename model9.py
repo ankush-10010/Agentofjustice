@@ -1,10 +1,34 @@
 from __future__ import annotations
 import os
 from typing import List, Dict, Optional, Union
-from groq import Groq
 import pandas as pd
 import json
+from huggingface_hub import login
+from huggingface_hub import InferenceClient
+import sys
+import csv
+from functools import lru_cache
+from tenacity import retry, stop_after_attempt, wait_exponential
 
+# ================== CONFIGURATION ==================
+os.environ["HF_API_TOKEN"] = ""  # Replace with your token
+
+# ================== QUOTA MANAGEMENT ==================
+class QuotaTracker:
+    def __init__(self, max_calls=50):
+        self.max_calls = max_calls
+        self.call_count = 0
+    def check_quota(self):
+        self.call_count += 1
+        remaining = self.max_calls - self.call_count
+        if remaining <= 5:
+            print(f"WARNING: Only {remaining} API calls left")
+        if self.call_count >= self.max_calls:
+            raise RuntimeError("API quota exhausted")
+
+quota_tracker = QuotaTracker(max_calls=50)
+
+# ================== CORE PARTICIPANT CLASS ==================
 class LegalParticipant:
     """Core class representing participants in legal proceedings"""
     
@@ -12,36 +36,59 @@ class LegalParticipant:
                 participant_name: str,
                 participant_role: str,
                 role_instructions: str,
-                llm_model: str = "llama3-70b-8192"):
+                llm_model: str = "mistralai/Mistral-7B-Instruct-v0.3"):
         self.participant_name = participant_name
         self.role = participant_role
         self.role_instructions = role_instructions.strip()
         self.conversation_history: List[Dict[str, str]] = []
-        self.llm_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+        self.llm_client = InferenceClient(llm_model, token=os.getenv("HF_API_TOKEN"))
         self.llm_model = llm_model
     
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+    @lru_cache(maxsize=100)
     def generate_response(self, input_message: str, **generation_params) -> str:
         """Produce a response based on the participant's role and conversation history"""
-        message_sequence = [{"role": "system", "content": self.role_instructions}]
-        message_sequence.extend(self.conversation_history)
-        message_sequence.append({"role": "user", "content": input_message})
+        quota_tracker.check_quota()
         
-        llm_response = self.llm_client.chat.completions.create(
-            model=self.llm_model,
-            messages=message_sequence,
-            temperature=0.7,
-            max_tokens=1024,
-            **generation_params
-        )
+        prompt = self._format_prompt(input_message)
         
-        response_content = llm_response.choices[0].message.content
-        
-        # Maintain conversation context
-        self.conversation_history.append({"role": "user", "content": input_message})
-        self.conversation_history.append({"role": "assistant", "content": response_content})
-        return response_content
+        try:
+            completion = self.llm_client.text_generation(
+                prompt,
+                max_new_tokens=1024,
+                temperature=0.7,
+                do_sample=True,
+                **generation_params
+            )
+            
+            response_content = completion.strip()
+            
+            # Maintain conversation context
+            self.conversation_history.append({"role": "user", "content": input_message})
+            self.conversation_history.append({"role": "assistant", "content": response_content})
+            
+            return response_content
+        except Exception as e:
+            print(f"Error generating response: {str(e)}")
+            return f"[SYSTEM ERROR: Could not generate response - {str(e)}]"
+    
+    def _format_prompt(self, user_msg: str) -> str:
+        """Format the prompt with system instructions and history"""
+        messages = [{"role": "system", "content": self.role_instructions}]
+        messages.extend(self.conversation_history)
+        messages.append({"role": "user", "content": user_msg})
 
+        prompt = ""
+        for m in messages:
+            prompt += f"<|{m['role']}|>\n{m['content']}\n"
+        prompt += "<|assistant|>\n"
+        return prompt
+    
+    def reset_history(self):
+        """Clear conversation history"""
+        self.conversation_history = []
 
+# ================== LEGAL PROCEEDINGS CLASS ==================
 class LegalProceedings:
     """Main class to manage and simulate legal proceedings"""
     
@@ -243,19 +290,28 @@ class LegalProceedings:
         # Generate case summary
         case_summary = self._generate_case_summary()
         
-        # Judicial determination
+        # Judicial determination with structured output
         determination_prompt = f"""
-        Review case materials and issue final determination.
-        Case summary: {case_summary}
+        [CASE DETAILS]
+        {self.case_details}
         
-        Conclude with either APPROVED (favoring petitioner) or REJECTED (favoring respondent).
+        [PROCEEDINGS SUMMARY]
+        {case_summary}
+        
+        You MUST follow this structured analysis:
+        1. Evidence Analysis: Categorize and weigh ALL evidence
+        2. Legal Standard Application: Apply proper burden of proof
+        3. Precedent Comparison: Cite relevant precedents
+        4. Final Verdict: Conclude with either APPROVED or REJECTED
+        
+        If evidence is exactly balanced, the verdict MUST be REJECTED.
         """
         
         judicial_determination = self.participants["presiding_judge"].generate_response(determination_prompt)
         self._record_interaction("presiding_judge", judicial_determination)
         
-        # Extract determination
-        if "APPROVED" in judicial_determination.upper():
+        # Extract and enforce definitive determination
+        if "APPROVED" in judicial_determination.upper() and "REJECTED" not in judicial_determination.upper():
             self.final_decision = 1
         else:
             self.final_decision = 0
@@ -283,9 +339,7 @@ class LegalProceedings:
         print(f"\n===== PROCEEDINGS CONCLUDED: OUTCOME {'APPROVED' if determination == 1 else 'REJECTED'} =====\n")
         return determination
 
-
-# Role-specific instructions
-
+# ================== ROLE INSTRUCTIONS ==================
 JUDICIAL_INSTRUCTIONS = """
 As *Justice Williams* presiding over these proceedings:
 Responsibilities:
@@ -386,6 +440,7 @@ Ethical Standards:
 • Remain composed during examination
 """
 
+# ================== CASE PROCESSING ==================
 def analyze_legal_cases(input_file: str):
     """Analyze legal cases from input file"""
     case_data = pd.read_csv(input_file)
@@ -411,6 +466,44 @@ def analyze_legal_cases(input_file: str):
     results = pd.DataFrame(determinations, columns=['ID', 'DETERMINATION'])
     return results
 
+def load_cases_from_file(filename):
+    """Load legal cases from a CSV file"""
+    max_size = sys.maxsize
+    while True:
+        try:
+            csv.field_size_limit(max_size)
+            break
+        except OverflowError:
+            max_size = max_size // 10
+    
+    cases = {}
+    
+    try:
+        with open(filename, 'r', encoding='utf-8') as file:
+            reader = csv.DictReader(file)
+            for row in reader:
+                if 'id' in row and 'text' in row:
+                    cases[row['id']] = row['text']
+    except Exception as e:
+        print(f"Error reading file: {e}")
+        return None
+    
+    return cases
+
+def generate_report(results):
+    """Generate a summary report of all case verdicts"""
+    with open("verdict_summary.txt", "w") as f:
+        f.write("LEGAL PROCEEDINGS SUMMARY REPORT\n")
+        f.write("="*50 + "\n\n")
+        
+        for case_id, determination in results:
+            f.write(f"Case {case_id}: {'APPROVED' if determination == 1 else 'REJECTED'}\n")
+        
+        approved = sum(1 for _, d in results if d == 1)
+        rejected = len(results) - approved
+        f.write(f"\nTotal Cases: {len(results)}\n")
+        f.write(f"Approved: {approved} ({approved/len(results)*100:.1f}%)\n")
+        f.write(f"Rejected: {rejected} ({rejected/len(results)*100:.1f}%)\n")
 
 if __name__ == "__main__":
     # Demonstration case
@@ -427,5 +520,6 @@ if __name__ == "__main__":
     print(f"Final determination: {'APPROVED' if case_outcome == 1 else 'REJECTED'}")
     
     # Process actual case file
-    case_results = analyze_legal_cases("/content/legal_cases.csv")
-    case_results.to_csv("/content/legal_determinations.csv", index=False)
+    case_results = analyze_legal_cases("legal_cases.csv")
+    case_results.to_csv("legal_determinations.csv", index=False)
+    generate_report(case_results)
